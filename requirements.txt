@@ -1,0 +1,6 @@
+opencv-python
+numpy
+pymavlink
+matplotlib
+scipy
+PyYAML

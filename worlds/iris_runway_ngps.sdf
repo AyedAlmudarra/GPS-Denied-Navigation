@@ -1,0 +1,114 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <world name="iris_runway_ngps">
+
+    <!-- Physics configuration -->
+    <physics name="default_physics" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- Core simulation systems -->
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-navsat-system"
+            name="gz::sim::systems::NavSat"/>
+
+    <!-- Visual environment -->
+    <scene>
+      <ambient>1.0 1.0 1.0 1</ambient>
+      <background>0.8 0.8 0.8 1</background>
+      <sky/>
+    </scene>
+
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Axes helper model -->
+    <model name="axes">
+      <static>true</static>
+      <link name="link">
+        <visual name="x">
+          <cast_shadows>false</cast_shadows>
+          <pose>5 0 0.1 0 0 0</pose>
+          <geometry><box><size>10 0.01 0.01</size></box></geometry>
+          <material><ambient>1 0 0 0.8</ambient></material>
+        </visual>
+        <visual name="y">
+          <cast_shadows>false</cast_shadows>
+          <pose>0 5 0.1 0 0 0</pose>
+          <geometry><box><size>0.01 10 0.01</size></box></geometry>
+          <material><ambient>0 1 0 0.8</ambient></material>
+        </visual>
+        <visual name="z">
+          <cast_shadows>false</cast_shadows>
+          <pose>0 0 5.1 0 0 0</pose>
+          <geometry><box><size>0.01 0.01 10</size></box></geometry>
+          <material><ambient>0 0 1 0.8</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Include the runway terrain -->
+    <include>
+      <uri>model://runway</uri>
+      <pose degrees="true">-29 545 0 0 0 363</pose>
+    </include>
+
+    <!-- Include the Iris UAV with gimbal camera -->
+    <include>
+      <uri>model://iris_with_gimbal</uri>
+      <pose>0 0 0.195 0 0 90</pose>
+    </include>
+
+    <!-- Include the arena model -->
+    <include>
+      <uri>model://arena</uri>
+      <pose>0 0 0.047 0 0 0</pose>
+    </include>
+
+    <!-- Global camera-streaming plugin -->
+    <plugin name="GstCameraPlugin"
+            filename="libGstCameraPlugin.so">
+      <!-- Correct sensor name, matches nested model sensor -->
+      <sensorName>iris_with_gimbal::iris_with_gimbal::gimbal::link::pitch_link::camera</sensorName>
+      <alwaysOn>true</alwaysOn>
+      <updateRate>30</updateRate>
+      <udp_host>127.0.0.1</udp_host>
+      <udp_port>5600</udp_port>
+      <use_basic_pipeline>true</use_basic_pipeline>
+      <use_cuda>false</use_cuda>
+    </plugin>
+
+  </world>
+</sdf>
+
