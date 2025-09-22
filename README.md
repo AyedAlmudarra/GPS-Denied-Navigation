@@ -17,7 +17,6 @@ End-to-end pipeline that fuses high-rate optical-flow VIO and low-rate global Vi
 - [Performance and stability tips](#performance-and-stability-tips)
 - [Map preparation & calibration](#map-preparation--calibration)
 - [Development notes](#development-notes)
-- [Images in documentation](#images-in-documentation)
 - [License & credits](#license--credits)
 
 ### What this repository provides
@@ -270,22 +269,6 @@ Result2 (camera HUD + map overlay at higher confidence):
 - GTSAM is optional; if not present, the optimizer falls back to a buffer-based mode (suitable for demos).
 - Logging: periodic summaries controlled by `logging.summary_interval_sec`; detailed logs in `navigation_debug.log`.
 
----
-
-## Images in documentation
-Yes. Add images to the repo (recommended: `docs/images/`) and reference them with relative paths in Markdown.
-
-Examples:
-```markdown
-![Pipeline](docs/images/pipeline.png)
-![Camera HUD example](src/satellite_image-main.png)
-```
-Guidelines:
-- Keep images under version control (e.g., `docs/images/`).
-- Use descriptive filenames; prefer PNG or SVG for diagrams.
-- For large assets (videos), link externally or place under `recordings/` and `.gitignore` as needed.
-
----
 
 ## License & credits
 - Derived from community efforts on GPS-denied UAV navigation and related experimentation.
