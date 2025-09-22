@@ -208,23 +208,17 @@ python3 src/tools/replay_reader.py --dir recordings/run_01 --fps 20 --show
 
 
 MetricsResult (trajectory colored by VPS confidence):
-```markdown
 ![MetricsResult](docs/images/MetricsResult.png)
-```
 - Scatter plot of estimated trajectory with point color = VPS confidence [0,1].
 - Reproduce: `python3 src/tools/metrics_cli.py --csv navigation_eval.csv --plot`.
 
 Result1 (camera HUD + map overlay at moderate confidence):
-```markdown
 ![Result1](docs/images/Result1.png)
-```
 - Left: Camera Feed with HUD (OF tracks, bars, pose text). Center: Map Position with trail, heading arrow, scale and north.
 - Shows a stable match near confidence ~0.6.
 
 Result2 (camera HUD + map overlay at higher confidence):
-```markdown
 ![Result2](docs/images/Result2.png)
-```
 - Similar scene under better texture/geometry; confidence ~0.75 with clearer alignment.
 
 ---
