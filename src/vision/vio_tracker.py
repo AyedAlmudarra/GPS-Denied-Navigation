@@ -3,6 +3,26 @@ from scipy.spatial.transform import Rotation as R
 import cv2
 import logging
 
+"""
+VIOTracker
+----------
+Extended Kalman Filter (EKF) based Visual–Inertial Odometry state estimator.
+
+- State (n=16): position (3), velocity (3), quaternion (4: x,y,z,w), accel bias (3), gyro bias (3)
+- Prediction: integrates IMU (accel/gyro) to propagate pose/velocity and covariance
+- Updates:
+  * Optical flow position delta (x,y with altitude as pseudo-z)
+  * Velocity (vx, vy)
+  * VPS global position (x,y,z) + separate nonlinear yaw update
+- Bias handling: simple random walk biases with small process noise
+- Gating: chi-square tests on innovations to reject outliers
+- Covariance management: clamped to avoid numerical blow-ups
+
+Notes
+- Quaternion convention is (x,y,z,w) to match SciPy's Rotation.
+- Gravity is +Z in the world frame by convention here; adjust if needed.
+"""
+
 class VIOTracker:
     """
     Visual-Inertial Odometry tracker using Extended Kalman Filter (EKF).
@@ -30,7 +50,7 @@ class VIOTracker:
         # Covariance matrix (16x16)
         self.P = np.eye(16) * 0.01
 
-        # Process noise covariance
+        # Process noise covariance (tunable)
         self.Q = np.eye(16)
         self.Q[0:3, 0:3] *= 0.01    # Position noise
         self.Q[3:6, 3:6] *= 0.1     # Velocity noise
@@ -68,7 +88,7 @@ class VIOTracker:
 
     def initialize(self, frame):
         """
-        Initialization method to prepare the tracker with an initial frame.
+        Prepare the tracker with an initial frame by resetting state and covariance.
         """
         self.initial_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
 
@@ -81,7 +101,7 @@ class VIOTracker:
 
     @staticmethod
     def quat_multiply(q1, q2):
-        """Multiply two quaternions q = q1 * q2."""
+        """Multiply two quaternions q = q1 * q2 in (x,y,z,w) order."""
         # q format: (x, y, z, w)
         x0, y0, z0, w0 = q1
         x1, y1, z1, w1 = q2
@@ -94,6 +114,7 @@ class VIOTracker:
 
     @staticmethod
     def quat_normalize(q):
+        """Normalize a quaternion to unit norm."""
         return q / np.linalg.norm(q)
 
     @staticmethod
@@ -106,6 +127,7 @@ class VIOTracker:
 
     @staticmethod
     def _wrap_angle(angle):
+        """Wrap angle (rad) to [-pi, pi]."""
         return (float(angle) + np.pi) % (2*np.pi) - np.pi
 
     def state_to_rotation(self):
@@ -115,13 +137,14 @@ class VIOTracker:
         return R.from_quat(q).as_matrix()
 
     def _clamp_covariance(self):
+        """Clamp covariance diagonal between preset min/max variances."""
         diag = np.clip(np.diag(self.P), self.min_var, self.max_var)
         self.P[np.diag_indices_from(self.P)] = diag
 
     def predict(self, imu_data, dt=None):
         """
         EKF prediction step: integrate IMU and propagate covariance.
-        imu_data expected to have attributes: ax, ay, az, gx, gy, gz
+        `imu_data` may have `.accel` and `.gyro` arrays or scalar fields ax..gz.
         """
         # Guard: if no IMU data, skip prediction
         if imu_data is None:
@@ -167,14 +190,14 @@ class VIOTracker:
         # Quaternion to rotation matrix
         Rwb = R.from_quat(q).as_matrix()
 
-        # Gravity compensation
+        # Gravity compensation: transform body accel to world and subtract gravity
         acc_world = Rwb @ acc - self.gravity
 
-        # State propagation
+        # State propagation (constant acceleration over dt)
         p_new = p + v*dt + 0.5 * acc_world * dt*dt
         v_new = v + acc_world * dt
 
-        # Quaternion update via gyro integration
+        # Quaternion update via gyro integration (small-angle approx avoided)
         omega_norm = np.linalg.norm(gyro)
         if omega_norm > 1e-12:
             delta_q = np.concatenate(([0], gyro/omega_norm * np.sin(omega_norm*dt/2)))
@@ -208,7 +231,8 @@ class VIOTracker:
 
     def update_flow(self, dx, dy, altitude, confidence=1.0):
         """
-        Update step using optical flow deltas as position correction.
+        Update using optical flow derived position delta: z = [x, y, z(altitude)].
+        Confidence scales measurement noise; gating protects against outliers.
         """
         z = np.array([dx, dy, altitude])
 
@@ -367,7 +391,7 @@ class VIOTracker:
             self.state[13:16] *= 0.99
 
     def update(self, dx, dy, altitude, confidence=1.0):
-        
+        """Convenience wrapper: apply flow update and return current position."""
         
         self.update_flow(dx, dy, altitude, confidence=confidence)
         pos = self.state[0:3]

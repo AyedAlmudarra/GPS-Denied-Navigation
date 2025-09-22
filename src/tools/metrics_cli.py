@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
+"""
+metrics_cli
+-----------
+Command-line utility to summarize navigation run logs (CSV) and optionally plot.
+
+Inputs: CSV produced by main loop with columns t,x,y,z,yaw,of_conf,vps_conf,vio_rate,vps_rate,truth_*.
+Outputs: Printed metrics like spans, mean confidences, FPS estimate, RMSE (if truth present), yaw error.
+"""
 import argparse
 import csv
 import math
 import statistics
 
+# Matplotlib is optional (headless environments). Fallback gracefully if unavailable.
 try:
     import matplotlib.pyplot as plt
 except Exception:
@@ -11,12 +20,23 @@ except Exception:
 
 
 def load_rows(path):
+    """Load CSV as a list of dict rows using the header row for keys."""
     with open(path, 'r') as f:
         reader = csv.DictReader(f)
         return list(reader)
 
 
 def compute_metrics(rows):
+    """Compute basic metrics for a run from CSV rows.
+
+    Returns a dict with:
+    - num_rows: number of samples
+    - x_span_m / y_span_m: min/max ranges
+    - vps_conf_mean / of_conf_mean: mean confidences
+    - fps_mean: mean instantaneous FPS (from dt between consecutive samples)
+    - pos_rmse_m: RMSE in meters if ENU truth present
+    - yaw_err_mean_rad: mean absolute yaw error (rad) if truth present
+    """
     xs = [float(r['x']) for r in rows]
     ys = [float(r['y']) for r in rows]
     conf = [float(r['vps_conf']) for r in rows]
@@ -45,8 +65,8 @@ def compute_metrics(rows):
             if not (math.isnan(gx) or math.isnan(gy) or math.isnan(gz)):
                 dx = x - gx
                 dy = y - gy
-                # If z is modeled, include; else skip
-                dz = 0.0 if math.isnan(gz) else (0.0)  # placeholder; height not modeled elsewhere
+                # If z is modeled, include; else skip (currently planar)
+                dz = 0.0 if math.isnan(gz) else (0.0)
                 errs.append(math.sqrt(dx*dx + dy*dy + dz*dz))
         if errs:
             metrics['pos_rmse_m'] = math.sqrt(sum(e*e for e in errs) / len(errs))
@@ -65,6 +85,7 @@ def compute_metrics(rows):
 
 
 def maybe_plot(rows):
+    """Show a simple scatter plot colored by VPS confidence if matplotlib is available."""
     if plt is None:
         return
     xs = [float(r['x']) for r in rows]
@@ -81,6 +102,7 @@ def maybe_plot(rows):
 
 
 def main():
+    """CLI entry: load CSV, print metrics, optionally plot."""
     ap = argparse.ArgumentParser()
     ap.add_argument('--csv', required=True, help='Path to eval CSV')
     ap.add_argument('--plot', action='store_true', help='Show simple plots')

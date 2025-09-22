@@ -1,15 +1,22 @@
 from dataclasses import dataclass
 import math
 
+"""
+Base data structures used across the navigation pipeline.
+
+Currently provides:
+- Location: simple geodetic location with a Haversine distance helper.
+"""
+
 @dataclass
 class Location:
-    """Geodetic location: latitude (°), longitude (°), altitude (m)."""
+    """Geodetic location with latitude (deg), longitude (deg), altitude (m)."""
     lat: float = 0.0
     lon: float = 0.0
     alt: float = 0.0
 
     def distance_to(self, other: "Location") -> float:
-        """Approximate Haversine distance (in meters)."""
+        """Approximate great-circle distance to another Location using Haversine (meters)."""
         R = 6_371_000.0  # Earth radius, m
         φ1, φ2 = math.radians(self.lat), math.radians(other.lat)
         Δφ = math.radians(other.lat - self.lat)

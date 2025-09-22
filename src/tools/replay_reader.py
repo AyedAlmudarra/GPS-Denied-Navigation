@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+replay_reader
+-------------
+Lightweight playback tool for recorded frames saved by the main loop recorder.
+
+- Input directory should contain files like frame_<timestamp>.png and optionally imu.csv
+- Plays back frames at a target FPS, either showing a window or sleeping headless
+"""
 import argparse
 import os
 import time
@@ -6,11 +14,13 @@ import cv2
 
 
 def list_frames(dir_path):
+    """Return sorted paths of recorded frame_*.png files in the directory."""
     files = sorted([f for f in os.listdir(dir_path) if f.startswith('frame_')])
     return [os.path.join(dir_path, f) for f in files]
 
 
 def main():
+    """CLI: iterate over recorded frames at a given FPS; optionally display."""
     ap = argparse.ArgumentParser()
     ap.add_argument('--dir', required=True, help='Recording directory (contains frame_*.png and imu.csv)')
     ap.add_argument('--fps', type=float, default=20.0, help='Playback FPS')

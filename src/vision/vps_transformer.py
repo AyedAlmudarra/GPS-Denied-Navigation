@@ -3,6 +3,34 @@ import numpy as np
 from collections import deque
 import logging
 
+"""
+VPSTransformer
+--------------
+Visual Place Recognition and 2D global pose extraction using SIFT features
+against a preloaded overhead map image, with optional coarse-to-fine scaling
+and grid tiling to improve feature coverage, plus temporal smoothing.
+
+- Detector: SIFT on both map and incoming frames.
+- Matcher: FLANN (KD-tree) with ratio test; robust homography via RANSAC.
+- Motion mask: Optional suppression of dynamic regions (mask=0 ignored).
+- Pyramid: Multi-scale search to handle scale discrepancies efficiently.
+- Tiling: Uniformly distribute features across image tiles for robustness.
+- Pose: Extract (x,y) via homography center mapping; yaw from 2x2 rotation.
+- Units: Pixel→meter conversion via `pixels_per_meter` if known, else via
+  pinhole scale using `altitude/focal_px`.
+- Smoothing: Confidence-weighted temporal smoothing with circular yaw mean.
+
+Inputs
+- map_path: grayscale map image path
+- nfeatures/min_matches/focal_px/ratio_thresh: SIFT+matching controls
+- pixels_per_meter: if provided, used for metric conversion
+- camera_K/camera_dist: optional undistortion of input frames
+- scale_levels: list of scale multipliers for pyramid (e.g. [1.0, 0.75, 0.5])
+- tile_rows/tile_cols/features_per_tile: tiling configuration
+- yaw_sign: +1 or -1 to align yaw convention with the rest of the system
+- early_score_threshold: set after init via attribute if desired for early-exit
+"""
+
 class VPSTransformer:
     """
     Enhanced Visual Place Recognition using SIFT (or optionally deep features),
@@ -41,7 +69,7 @@ class VPSTransformer:
         # For temporal smoothing
         self.pose_buffer = deque(maxlen=smoothing_window)  # Stores dicts with pose and confidence
 
-        # FLANN matcher setup
+        # FLANN matcher setup (KD-Tree for SIFT)
         self.flann = cv2.FlannBasedMatcher(
             dict(algorithm=1, trees=5),
             dict(checks=50)
@@ -59,6 +87,7 @@ class VPSTransformer:
         logging.info(f"[VPS INIT] Loaded map {map_path} with {len(self.kp_map)} keypoints")
 
     def _ensure_ud_maps(self, img):
+        """Ensure undistortion maps for provided image shape are ready if K/dist given."""
         if self.K is None or self.dist is None:
             return False
         h, w = img.shape[:2]
@@ -70,7 +99,7 @@ class VPSTransformer:
         return True
 
     def preprocess_frame(self, frame):
-        """Convert to grayscale and apply histogram equalization to normalize illumination."""
+        """Convert to grayscale, equalize histogram, optionally undistort."""
         gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         equalized = cv2.equalizeHist(gray)
         if self._ensure_ud_maps(equalized):
@@ -78,6 +107,7 @@ class VPSTransformer:
         return equalized
 
     def _build_pyramid(self, img, scales):
+        """Construct image pyramid at the requested scale factors."""
         pyr = []
         for s in scales:
             if abs(s - 1.0) < 1e-6:
@@ -90,11 +120,13 @@ class VPSTransformer:
         return pyr
 
     def _resize_mask(self, mask, target_shape):
+        """Resize motion mask to match target image shape."""
         if mask is None:
             return None
         return cv2.resize(mask, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
 
     def _detect_tiled(self, img, mask):
+        """Run SIFT detection, optionally enforcing uniform tiling coverage via masks."""
         # If no tiling configured, run once
         if self.tile_rows <= 0 or self.tile_cols <= 0 or self.features_per_tile <= 0:
             kp, des = self.sift.detectAndCompute(img, mask)
@@ -159,7 +191,7 @@ class VPSTransformer:
             if des_frame is None or len(kp_frame) < self.min_matches:
                 continue
 
-            # Match descriptors
+            # Match descriptors (map→frame) and apply Lowe's ratio test
             matches = self.flann.knnMatch(self.des_map, des_frame, k=2)
             good_matches = [m for m, n in matches if m.distance < self.ratio_thresh * n.distance] if matches else []
             if len(good_matches) < self.min_matches:
@@ -213,7 +245,7 @@ class VPSTransformer:
 
         M, shape_used = best
 
-        # Extract yaw from homography
+        # Extract yaw from homography (ensure rotation is proper via SVD)
         rot_mat = M[0:2, 0:2]
         U, _, Vt = np.linalg.svd(rot_mat)
         R_mat = U @ Vt

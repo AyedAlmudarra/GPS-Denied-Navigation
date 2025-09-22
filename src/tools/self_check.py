@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+self_check
+---------
+Sanity checks for core modules without requiring Gazebo or MAVLink runtime.
+- Ensures `src.*` imports work from tools path
+- Exercises OpticalFlowTracker and VIOTracker on synthetic data
+- Optionally exercises VPSTransformer if the map asset is available
+- Prints human-readable status and exits nonzero on required failures
+"""
 import os
 import sys
 import cv2
@@ -19,6 +28,7 @@ from src.vision.vps_transformer import VPSTransformer
 
 
 class DummyIMU:
+    """Tiny IMU stub with zero acceleration/gyro for smoke testing."""
     def __init__(self):
         self.accel = np.array([0.0, 0.0, 0.0])
         self.gyro = np.array([0.0, 0.0, 0.0])
@@ -26,12 +36,14 @@ class DummyIMU:
 
 
 def load_config():
+    """Load src/config.yaml from the repository."""
     cfg_path = os.path.join(SRC_DIR, 'config.yaml')
     with open(cfg_path, 'r') as f:
         return yaml.safe_load(f)
 
 
 def check_config(cfg):
+    """Lightweight config sanity: checks ppm presence/format and prints guidance."""
     print('[SELF-CHECK] Config sanity...')
     try:
         m = cfg.get('map', {})
@@ -44,6 +56,7 @@ def check_config(cfg):
 
 
 def check_optical_flow(cfg):
+    """Construct and run OpticalFlowTracker on a synthetic gradient frame."""
     print('[SELF-CHECK] OpticalFlowTracker...')
     of = OpticalFlowTracker(cfg)
     # Create a simple gradient image
@@ -60,6 +73,7 @@ def check_optical_flow(cfg):
 
 
 def check_vio(cfg):
+    """Construct and step VIOTracker predict/update on dummy inputs; verify state keys."""
     print('[SELF-CHECK] VIOTracker...')
     vio = VIOTracker(cfg)
     # Dummy frame
@@ -76,6 +90,7 @@ def check_vio(cfg):
 
 
 def check_vps(cfg):
+    """Construct VPSTransformer if map available; run a single match against the map image itself."""
     print('[SELF-CHECK] VPSTransformer...')
     try:
         map_path = cfg['vision']['vps']['map_path']
@@ -118,6 +133,7 @@ def check_vps(cfg):
 
 
 def main():
+    """Run all self-checks and exit with code 0 on success, 1 otherwise."""
     cfg = load_config()
     failures = 0
     try:

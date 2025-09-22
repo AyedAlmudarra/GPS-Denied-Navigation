@@ -9,6 +9,17 @@ Enhanced GPS-denied navigation loop with:
 • MAVLink VISION_POSITION_ESTIMATE output
 • Dual-screen visualization (camera + map estimate)
 • Debug logs, timestamps, and adaptive fusion
+
+High-level flow
+- Initialize modules from config: camera, MAVLink, OpticalFlow, VIO EKF, VPS, factor graph
+- Wait for takeoff altitude, bootstrap initial pose from VPS if available
+- In a loop:
+  * Read frame and IMU, compute altitude
+  * Run OF/VIO at configured/adaptive rate; optionally fuse ATTITUDE yaw
+  * Run VPS at configured/adaptive rate; maintain smoothed fixes buffer
+  * Add relative+absolute+yaw factors to optimizer; run optimization
+  * Publish fused vision pose to MAVLink with adaptive covariance
+  * Optional UI overlays for diagnostics; periodic CSV summaries
 """
 
 import os
@@ -40,23 +51,27 @@ logging.basicConfig(
 
 @dataclass
 class IMUData:
+    """Simple IMU container with `timestamp`, `accel` (3,), `gyro` (3,)."""
     timestamp: float
     accel: Optional[np.ndarray] = None
     gyro: Optional[np.ndarray] = None
 
 @dataclass
 class FrameData:
+    """Camera frame with `timestamp` and BGR image array."""
     timestamp: float
     image: np.ndarray
 
 @dataclass
 class OpticalFlowOutput:
+    """Optical flow output packaged for the main loop."""
     dx: float
     dy: float
     confidence: float
 
 @dataclass
 class VPSFix:
+    """A smoothed VPS fix with position, yaw, and confidence."""
     x: float
     y: float
     z: float
@@ -65,6 +80,7 @@ class VPSFix:
 
 @dataclass
 class PoseEstimate:
+    """Fused pose estimate fields used by overlays and logging."""
     x: float
     y: float
     z: float
@@ -72,7 +88,9 @@ class PoseEstimate:
 
 
 class NavigationPipeline:
+    """Top-level orchestrator for the GPS-denied navigation runtime."""
     def __init__(self, cfg_path=None):
+        """Load configuration, initialize subsystems, and prepare runtime state."""
         base_dir = os.path.dirname(os.path.abspath(__file__))
         cfg_file = cfg_path or os.path.join(base_dir, "config.yaml")
 
@@ -96,19 +114,22 @@ class NavigationPipeline:
         except Exception:
             pass
 
+        # MAVLink connection to ArduPilot (request IMU/ATTITUDE/GPS streams)
         self.mav = MAVLinkSender(
             connection_str=self.cfg["mavlink"].get("connection_str", "udpout:localhost:14550"),
             vision_rate_hz=self.cfg["mavlink"].get("vision_rate_hz", 10)
         )
         self.mav.start()
 
+        # Gazebo H.264 UDP camera via GStreamer backend
         self.camera = GazeboCamera(udp_port=self.cfg["camera"].get("udp_port", 5600))
         self.camera.start()
 
+        # Visual modules
         vio_cfg = self.cfg["vision"]["vio"]
-        self.optical_vio = OpticalFlowTracker(self.cfg)
+        self.optical_vio = OpticalFlowTracker(self.cfg)   # image-space OF → planar meters
         
-        self.imu_vio = VIOTracker(self.cfg)
+        self.imu_vio = VIOTracker(self.cfg)              # EKF on IMU + OF/VPS updates
 
         # VPSTransformer with optional pixels_per_meter and camera intrinsics from config
         ppm = self.cfg.get("map", {}).get("pixels_per_meter", None)
@@ -140,17 +161,20 @@ class NavigationPipeline:
         except Exception:
             pass
 
+        # Factor-graph optimizer wrapper (GTSAM if available; simple fallback otherwise)
         self.fuser = FactorGraphOptimizer(
             window_size=self.cfg["fusion"].get("window_size", 10),
             config=self.cfg
         )
 
+        # Map image for overlays
         self.map_image = cv2.imread(self.cfg["vision"]["vps"]["map_path"])
         self.x = self.y = self.z = self.yaw = 0.0
         # Wall-clock used for logging/CSV; monotonic for scheduling
         self._last_vio_time_mono = self._mono()
         self._last_vps_time_mono = self._mono()
 
+        # Visualization and confidence/FPS tracking
         self.trail = []
         self.last_confidence = 0.0
         self.last_fps = 0.0
@@ -186,6 +210,13 @@ class NavigationPipeline:
         # Avoid double-smoothing: by default rely on VPS internal smoothing
         self.main_loop_vps_smoothing = bool(self.cfg["vision"]["vps"].get("main_loop_smoothing", False))
 
+        # UI toggles
+        self.ui_show_tracks = True
+        self.ui_show_mask = False
+        self.ui_show_bars = True
+        self.ui_show_scale = True
+        self._ppm_overlay = float(self.cfg.get("map", {}).get("pixels_per_meter", 20) or 20)
+
         # Watchdogs
         rt = self.cfg.get("runtime", {})
         wd = rt.get("watchdogs", {})
@@ -199,7 +230,7 @@ class NavigationPipeline:
         self.of_fail_count = 0
         self.of_fail_threshold = int(wd.get("of_fail_threshold", 5))
 
-        # Adaptive rates
+        # Adaptive rates configuration
         ar = rt.get("adaptive_rates", {})
         self.adaptive_enabled = bool(ar.get("enabled", False))
         self.vio_rate_min = float(ar.get("vio_rate_min_hz", 10))
@@ -241,7 +272,7 @@ class NavigationPipeline:
                 self._csv_file = None
                 self._csv_writer = None
 
-        # Recording
+        # Recording (frames, IMU, optional video)
         rec_cfg = rt.get("recording", {})
         self.rec_enabled = bool(rec_cfg.get("enabled", False))
         self.rec_dir = rec_cfg.get("dir", "recordings/run_01")
@@ -275,10 +306,12 @@ class NavigationPipeline:
                 self._rec_vid = cv2.VideoWriter(os.path.join(self.rec_dir, 'video.mp4'), fourcc, self.rec_video_fps, size)
 
     def _get_altitude(self):
+        """Return current relative altitude in meters from GLOBAL_POSITION_INT if available."""
         msg = self.mav.conn.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
         return msg.relative_alt / 1000.0 if msg else self.z
 
     def _get_attitude_yaw(self):
+        """Return ATTITUDE yaw (radians) if available, applying configured yaw_sign."""
         att = None
         try:
             att = self.mav.latest_attitude()
@@ -310,20 +343,45 @@ class NavigationPipeline:
         return IMUData(timestamp=ts, accel=accel, gyro=gyro)
 
     def _log_data(self, **kwargs):
-        # Minimal per-frame logging; summaries printed periodically
+        """Placeholder for per-frame detailed logging; summaries handled separately."""
         pass
 
     def _log_summary(self, **kwargs):
+        """Emit a single-line summary with key metrics for easy tailing."""
         log_msg = ", ".join(f"{k}={v}" for k, v in kwargs.items())
         logging.info(log_msg)
 
+    def _draw_conf_bars(self, frame, of_conf: float, vps_conf: float):
+        """Draw simple vertical confidence bars for OF and VPS on the given frame."""
+        try:
+            h, w = frame.shape[:2]
+            bar_w = int(18)
+            pad = 10
+            max_h = int(0.35 * h)
+            # normalize 0..1
+            of_h = int(max(0.0, min(1.0, of_conf)) * max_h)
+            vps_h = int(max(0.0, min(1.0, vps_conf)) * max_h)
+            # background
+            cv2.rectangle(frame, (pad, pad), (pad + bar_w, pad + max_h), (40, 40, 40), 1)
+            cv2.rectangle(frame, (pad*2 + bar_w, pad), (pad*2 + bar_w*2, pad + max_h), (40, 40, 40), 1)
+            # bars
+            of_color = (0, 255, 0) if of_conf >= 0.5 else ((0, 200, 255) if of_conf >= 0.25 else (0, 0, 255))
+            vps_color = (0, 255, 0) if vps_conf >= 0.5 else ((0, 200, 255) if vps_conf >= 0.25 else (0, 0, 255))
+            cv2.rectangle(frame, (pad+1, pad + max_h - of_h), (pad + bar_w - 1, pad + max_h - 1), of_color, -1)
+            cv2.rectangle(frame, (pad*2 + bar_w + 1, pad + max_h - vps_h), (pad*2 + bar_w*2 - 1, pad + max_h - 1), vps_color, -1)
+            cv2.putText(frame, "OF", (pad, pad + max_h + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+            cv2.putText(frame, "VPS", (pad*2 + bar_w, pad + max_h + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+        except Exception:
+            pass
+
     def _draw_map_overlay(self, x, y, yaw=0.0, confidence=0.0):
+        """Render a simple map overlay with position trail, heading arrow, and scale."""
         if self.map_image is None:
             return np.zeros((400, 400, 3), dtype=np.uint8)
 
         overlay = self.map_image.copy()
         # Use map.pixels_per_meter for consistent scaling
-        scale = self.cfg.get("map", {}).get("pixels_per_meter", 20)
+        scale = self.cfg.get("map", {}).get("pixels_per_meter", 20) or 20
         h, w = overlay.shape[:2]
 
         px = int(w / 2 + x * scale)
@@ -348,9 +406,30 @@ class NavigationPipeline:
         conf_text = f"Confidence: {confidence:.2f}"
         cv2.putText(overlay, conf_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+        # Scale bar and north arrow
+        if self.ui_show_scale:
+            try:
+                ppm = float(self._ppm_overlay)
+                meters = 5
+                px_len = int(meters * ppm)
+                px_len = max(40, min(px_len, int(0.25*w)))
+                x0 = int(w*0.07)
+                y0 = int(h*0.92)
+                cv2.line(overlay, (x0, y0), (x0 + px_len, y0), (255,255,255), 3)
+                cv2.line(overlay, (x0, y0-5), (x0, y0+5), (255,255,255), 3)
+                cv2.line(overlay, (x0 + px_len, y0-5), (x0 + px_len, y0+5), (255,255,255), 3)
+                cv2.putText(overlay, f"{meters} m", (x0 + px_len + 8, y0+5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                # north arrow (up)
+                nax, nay = int(w*0.93), int(h*0.85)
+                cv2.arrowedLine(overlay, (nax, nay+25), (nax, nay-25), (255,255,255), 3, tipLength=0.35)
+                cv2.putText(overlay, "N", (nax-8, nay-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            except Exception:
+                pass
+
         return overlay
 
     def _draw_camera_overlay(self, frame, altitude, x, y, z, yaw, confidence):
+        """Render text overlays, confidence bars, OF track arrows, and optional mask inset."""
         overlay = frame.copy()
 
         info_lines = [
@@ -363,16 +442,38 @@ class NavigationPipeline:
 
         y0, dy = 30, 25
         for i, line in enumerate(info_lines):
-            y = y0 + i * dy
-            cv2.putText(overlay, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            ytxt = y0 + i * dy
+            cv2.putText(overlay, line, (10, ytxt), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # Draw optical flow arrows
-        if hasattr(self.optical_vio, 'last_points') and hasattr(self.optical_vio, 'prev_points'):
+        # Confidence bars
+        if self.ui_show_bars:
+            self._draw_conf_bars(overlay, getattr(self, '_last_of_conf', 0.0), self.last_confidence)
+
+        # Draw optical flow arrows (tracks)
+        if self.ui_show_tracks and hasattr(self.optical_vio, 'last_points') and hasattr(self.optical_vio, 'prev_points'):
             if self.optical_vio.last_points is not None and self.optical_vio.prev_points is not None:
                 for p0, p1 in zip(self.optical_vio.prev_points, self.optical_vio.last_points):
                     p0 = tuple(map(int, p0.ravel()))
                     p1 = tuple(map(int, p1.ravel()))
                     cv2.arrowedLine(overlay, p0, p1, (0, 255, 255), 1, tipLength=0.3)
+
+        # Motion mask inset
+        try:
+            if self.ui_show_mask and hasattr(self.optical_vio, 'motion_mask') and self.optical_vio.motion_mask is not None:
+                mask = self.optical_vio.motion_mask
+                mh, mw = mask.shape[:2]
+                scale = 160 / float(mw)
+                mres = cv2.resize(mask, (160, int(mh*scale)), interpolation=cv2.INTER_NEAREST)
+                mres_col = cv2.applyColorMap((255-mres), cv2.COLORMAP_OCEAN)
+                x0 = overlay.shape[1]-mres_col.shape[1]-10
+                y0 = 10
+                roi = overlay[y0:y0+mres_col.shape[0], x0:x0+mres_col.shape[1]]
+                alpha = 0.55
+                cv2.addWeighted(mres_col, alpha, roi, 1-alpha, 0, roi)
+                cv2.rectangle(overlay, (x0, y0), (x0+mres_col.shape[1], y0+mres_col.shape[0]), (255,255,255), 1)
+                cv2.putText(overlay, "Mask", (x0+4, y0+18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        except Exception:
+            pass
 
         return overlay
 
@@ -407,6 +508,7 @@ class NavigationPipeline:
             logging.warning(f"[CONFIG] Validation encountered an issue: {e}")
 
     def _read_imu(self):
+        """Fetch latest IMU/ATTITUDE sample from MAVLink caches; append to buffers and record if enabled."""
         imu_raw = self.mav.latest_imu()
         if imu_raw:
             imu_data = IMUData(
@@ -428,6 +530,7 @@ class NavigationPipeline:
         return None
 
     def _read_frame(self):
+        """Read next camera frame (non-blocking) and push to frame buffer; optionally record to disk/video."""
         frame, _ = self.camera.read(timeout=0.1)
         if frame is not None:
             frame_data = FrameData(timestamp=time.time(), image=frame)
@@ -449,6 +552,7 @@ class NavigationPipeline:
         return None
 
     def _adjust_rates(self, of_conf, vps_conf):
+        """Adapt VIO and VPS processing rates based on confidence with hysteresis and EMA smoothing."""
         if not self.adaptive_enabled:
             return
         # VIO rate adapts to OF confidence with hysteresis and smoothing
@@ -466,6 +570,7 @@ class NavigationPipeline:
         self._vps_rate_hz = (1.0 - self._rate_alpha) * self._vps_rate_hz + self._rate_alpha * self._vps_rate_target
 
     def _process_optical_flow(self, frame: np.ndarray, altitude: float) -> Optional[OpticalFlowOutput]:
+        """Run optical flow update and wrap result into `OpticalFlowOutput`. Returns None on failure."""
         # Use last measured dt from monotonic clock when available
         dt_hint = self._mono() - self._last_vio_time_mono if self._last_vio_time_mono else None
         res = self.optical_vio.update(frame, altitude, dt=dt_hint)
@@ -475,6 +580,7 @@ class NavigationPipeline:
         return OpticalFlowOutput(dx, dy, conf)
 
     def _process_vps(self, frame: np.ndarray, altitude: float) -> Optional[VPSFix]:
+        """Run VPS matcher with optional motion mask and return latest fix pushed to buffer."""
         motion_mask = self.optical_vio.motion_mask if self.use_motion_mask else None
         match = self.vps_transform.match(frame, motion_mask, altitude)
         if match:
@@ -497,6 +603,7 @@ class NavigationPipeline:
         return None
 
     def _compute_smoothed_vps(self) -> VPSFix:
+        """Compute confidence-weighted average of buffered VPS fixes with circular yaw mean."""
         if not self.vps_buffer:
             return VPSFix(0.0, 0.0, 0.0, 0.0, 0.0)
 
@@ -517,6 +624,7 @@ class NavigationPipeline:
         return VPSFix(avg_x, avg_y, avg_z, avg_yaw, avg_conf)
 
     def _add_to_factor_graph(self, vio_dx, vio_dy, vps_fix: VPSFix, of_confidence: float):
+        """Add relative/absolute/yaw/continuity factors with adaptive covariance into the optimizer."""
         now = time.time()
         t0 = self.fuser.timestamps[-1] if getattr(self.fuser, 'timestamps', []) else now
 
@@ -560,6 +668,7 @@ class NavigationPipeline:
                 pass
 
     def initialize(self):
+        """Block until takeoff altitude is reached, initialize trackers, seed initial pose."""
         print("[INIT] Waiting for takeoff...")
         target_alt = self.cfg["mission"].get("takeoff_alt", 10.0)
 
@@ -577,9 +686,11 @@ class NavigationPipeline:
             print("[ERROR] No camera frame received during init.")
             sys.exit(1)
 
+        # Initialize visual modules using first frame
         self.optical_vio.initialize(frame_data.image)
         self.imu_vio.initialize(frame_data.image)
 
+        # Bootstrap pose from VPS if possible
         vps_fix = self._process_vps(frame_data.image, target_alt)
         if vps_fix:
             dx, dy, dz, conf = vps_fix.x, vps_fix.y, vps_fix.z, vps_fix.confidence
@@ -596,6 +707,7 @@ class NavigationPipeline:
         print(f"[INIT] Start at x={dx:.2f}, y={dy:.2f}, z={dz:.2f}, yaw={self.yaw:.2f}")
 
     def run(self):
+        """Main loop: schedule OF/VIO and VPS, fuse, publish to MAVLink, and optionally render UI."""
         vps_dt = 1.0 / self.cfg["vision"]["vps"].get("rate_hz", 1)
         vio_dt_cfg = 1.0 / self.cfg["vision"]["vio"].get("flow_rate_hz", 30)
 
@@ -614,6 +726,7 @@ class NavigationPipeline:
                 # Optical flow + VIO prediction (at vio rate)
                 of_confidence = 0.0
                 now_mono = self._mono()
+                # If adaptive enabled, recompute schedule intervals from current targets
                 if self.adaptive_enabled:
                     vio_dt_cfg = 1.0 / max(self.vio_rate_min, min(self.vio_rate_max, self._vio_rate_hz))
                     vps_dt = 1.0 / max(self.vps_rate_min, min(self.vps_rate_max, self._vps_rate_hz))
@@ -626,6 +739,7 @@ class NavigationPipeline:
                         self.of_fail_count += 1
                     else:
                         of_confidence = of_output.confidence
+                        self._last_of_conf = of_confidence
                         if of_confidence <= 1e-5:
                             self.of_fail_count += 1
                         else:
@@ -697,7 +811,7 @@ class NavigationPipeline:
                         smoothed_vps = VPSFix(self.x, self.y, self.z, self.yaw, 0.0)
                         self.last_confidence = 0.0
 
-                # Watchdogs
+                # Watchdogs (OF/VPS/IMU timeouts and recovery actions)
                 noww = time.time()
                 noww_mono = self._mono()
                 if (noww_mono - self._last_of_ok_mono) > self.of_timeout and self.of_fail_count >= self.of_fail_threshold:
@@ -788,10 +902,31 @@ class NavigationPipeline:
                     cv2.imshow("Camera Feed", camera_overlay)
                     cv2.imshow("Map Position", map_overlay)
 
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
                         break
+                    elif key == ord('t'):
+                        self.ui_show_tracks = not self.ui_show_tracks
+                    elif key == ord('m'):
+                        self.ui_show_mask = not self.ui_show_mask
+                    elif key == ord('b'):
+                        self.ui_show_bars = not self.ui_show_bars
+                    elif key == ord('n'):
+                        self.ui_show_scale = not self.ui_show_scale
+                    elif key == ord('r'):
+                        try:
+                            self.optical_vio.reset()
+                        except Exception:
+                            pass
+                    elif key == ord('p'):
+                        try:
+                            ts = int(time.time()*1000)
+                            cv2.imwrite(os.path.join(self.rec_dir, f"shot_cam_{ts}.png"), camera_overlay)
+                            cv2.imwrite(os.path.join(self.rec_dir, f"shot_map_{ts}.png"), map_overlay)
+                        except Exception:
+                            pass
 
-                # FPS
+                # FPS (loop rate measured by monotonic clock)
                 end_time_mono = self._mono()
                 dt_loop = end_time_mono - loop_start_mono
                 if dt_loop > 0:
@@ -800,6 +935,7 @@ class NavigationPipeline:
         except KeyboardInterrupt:
             print("[EXIT] Stopping navigation pipeline...")
         finally:
+            # Graceful teardown
             self.camera.stop()
             self.mav.stop()
             if self._csv_file:
@@ -824,4 +960,5 @@ if __name__ == "__main__":
     nav = NavigationPipeline()
     nav.initialize()
     nav.run()
+
 

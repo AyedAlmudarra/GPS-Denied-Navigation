@@ -3,94 +3,78 @@
 camera:
   # UDP port on which Gazebo publishes the H.264 video stream
   udp_port: 5600
-  # Optional camera intrinsics (if known)
+  # Optional camera intrinsics (if known). If omitted, undistortion is skipped.
+  # Prefer calibrated values from your camera; fx/fy in pixels, cx/cy in pixels.
   fx: 525.0
   fy: 525.0
   cx: 320.0
   cy: 240.0
-  # Optional radial/tangential distortion coefficients
+  # Optional radial/tangential distortion coefficients [k1, k2, p1, p2, k3]
   distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
 
 vision:
   # Optical flow tracker parameters for Visual-Inertial Odometry (VIO)
   flow:
-    max_corners: 200          # Max number of features to track
-    quality_level: 0.01       # Minimum accepted quality of corners
+    max_corners: 500          # Increase density of seeded ORB features
+    quality_level: 0.01       # Minimum accepted quality of corners (Shi-Tomasi)
     min_distance: 7           # Minimum pixel distance between features
-    block_size: 7             # Block size for feature detection
+    block_size: 7             # Block size for corner detection
     win_size: 21              # Window size for LK optical flow
     max_level: 3              # Max pyramid level for LK optical flow
-    min_texture_var: 100.0    # Minimum texture variance to proceed
-    zupt_threshold: 0.01      # Threshold to detect zero velocity update
-    flow_reset_threshold: 0.5 # Threshold for flow magnitude to reset tracker
-    focal_length_px: 525.0    # Camera focal length in pixels
+    min_texture_var: 40.0     # Lower threshold to accept low-texture scenes
+    zupt_threshold: 0.01      # Zero-velocity update threshold (meters per frame)
+    flow_reset_threshold: 0.5 # Flow magnitude to trigger reset on failure (px)
+    focal_length_px: 525.0    # Camera focal length in pixels (used for px→m)
     # Robust OF tunables
-    ransac_reproj_thresh: 3.0
-    residual_scale: 3.0
-    lk_error_thresh: 20.0
-    min_of_confidence: 0.1
-    roi_pad_px: 40
+    ransac_reproj_thresh: 3.0 # Reprojection threshold for affine RANSAC (px)
+    residual_scale: 3.0       # MAD scale for residual gating
+    lk_error_thresh: 20.0     # LK per-point error threshold (px)
+    min_of_confidence: 0.25   # Downstream gating; not used directly here
+    roi_pad_px: 40            # ROI padding around last inliers for re-seeding
     # FB-LK and grid seeding
-    fb_check_enabled: true
-    fb_error_thresh: 2.0
-    grid_rows: 4
-    grid_cols: 6
-    features_per_cell: 10
+    fb_check_enabled: true    # Enable forward–backward LK consistency check
+    fb_error_thresh: 1.5      # FB error threshold (px)
+    grid_rows: 8              # Grid rows for uniform feature seeding (0 disables)
+    grid_cols: 10             # Grid cols for uniform feature seeding (0 disables)
+    features_per_cell: 12     # Features per grid cell when grid is enabled
     # Performance: process-of downscale factor (1.0 = native)
-    downscale: 1.0
+    downscale: 0.5            # Downscale image before LK for speed; rescaled back
 
-  # Visual Inertial Odometry (VIO) configuration
+  # Visual Inertial Odometry (VIO) configuration (cleaned)
   vio:
     flow_rate_hz: 20            # Optical flow update rate in Hz
-    resize_factor: 0.5          # Resize factor for debug image
-    altitude_ref: 1.0           # Reference altitude in meters
-    lk_params:
-      winSize: [21, 21]         # LK optical flow window size
-      maxLevel: 2               # Pyramid levels for LK
-      criteria: [COUNT+EPS, 30, 0.03]  # Termination criteria for LK
-    feature_params:
-      maxCorners: 100           # Max corners for feature detection
-      qualityLevel: 0.3         # Quality level for features
-      minDistance: 7            # Minimum distance between features
-      blockSize: 7              # Block size for feature detection
-    min_cov: 0.01               # Minimum covariance in VIO filter
-    max_cov: 10.0               # Maximum covariance allowed
-    proc_noise_pos: 0.1         # Process noise for position
-    proc_noise_vel: 0.1         # Process noise for velocity
-    proc_noise_att: 0.01        # Process noise for attitude
-    flow_noise: 0.1             # Measurement noise for flow
-    alt_noise: 0.1              # Measurement noise for altitude
-    init_P: 0.1                 # Initial covariance
-    # Fuse ATTITUDE yaw directly into EKF each cycle
-    yaw_update_from_attitude: false
+    max_cov: 2.0                # Adaptive covariance ceiling for current EKF
+    # Fuse ATTITUDE yaw directly into EKF each cycle (nonlinear yaw update)
+    yaw_update_from_attitude: true
 
   # Visual Place Recognition (VPS) using SIFT matcher parameters
   vps:
     map_path: "src/satellite_image-main.png"  # Path to stitched satellite map
-    nfeatures: 2000             # Number of SIFT keypoints
-    min_matches: 5              # Minimum good matches to accept fix
-    focal_px: 476.7             # Camera focal length in pixels
+    nfeatures: 6000             # SIFT keypoints for the map and frames
+    min_matches: 20             # Minimum good matches to accept a homography fix
+    focal_px: 525.0             # Must match camera.fx/fy when using focal fallback
     rate_hz: 1                  # VPS fix update rate in Hz
-    max_jump_m: 10.0            # Reject large jumps at low confidence
+    max_jump_m: 3.0             # Reject large jumps at low confidence
     # Coarse-to-fine and tiling
-    scale_levels: [1.0, 0.75, 0.5]
-    tile_rows: 3
-    tile_cols: 4
-    features_per_tile: 50
-    ratio_thresh: 0.75
-    use_motion_mask: false
+    scale_levels: [1.0, 0.85, 0.7, 0.55, 0.4]  # Pyramid scales for search
+    tile_rows: 4                # Grid tiling rows for uniform keypoint coverage
+    tile_cols: 6                # Grid tiling cols for uniform keypoint coverage
+    features_per_tile: 60       # SIFT features to keep per tile
+    ratio_thresh: 0.75          # Lowe ratio test for FLANN matches
+    use_motion_mask: true       # Suppress dynamic image regions from OF residuals
     # Early-exit threshold on pyramid score (0 disables)
-    early_score_threshold: 0.0
+    early_score_threshold: 0.40 # Stop early if match score exceeds this
+    smoothing_window: 10        # Temporal smoothing window for pose estimates
 
   use_flow_as_velocity: false   # Interpret flow as velocity-like measurement
 
 fusion:
   window_size: 10              # Sliding window size for factor graph optimization
-  abs_sigma: 1.0               # Sigma for absolute (VPS) factors
-  rel_sigma: 0.1               # Sigma for relative (VIO) factors
+  abs_sigma: 0.7               # Stronger absolute factors (Pose3 sigmas, meters/rad)
+  rel_sigma: 0.5               # Weaker relative factors
   yaw_prior_sigma: 0.05        # Sigma (radians) for yaw prior from ATTITUDE
   yaw_sign: 1                  # Apply +1 or -1 to yaw prior/VPS yaw if needed
-  continuity_sigma: 0.5        # Optional continuity prior sigma (lower = tighter)
+  continuity_sigma: 0.3        # Optional continuity prior sigma (lower = tighter)
   # Robust losses and adaptive noise
   robust_loss: huber           # none|huber|cauchy|geman
   robust_delta: 1.0            # Delta for robust loss
@@ -105,10 +89,10 @@ mission:
   takeoff_alt: 5.0            # Altitude threshold to begin vision operations (meters)
 
 map:
-  pixels_per_meter: 10        # Map scale: pixels per meter for overlays
+  pixels_per_meter: 20        # Numeric value for overlays; set accurate ppm later
 
 ui:
-  headless: false             # If true, no UI windows will be shown
+  headless: true              # If true, no UI windows will be shown
 
 logging:
   summary_interval_sec: 1.0   # Period for summary log lines
@@ -120,7 +104,7 @@ runtime:
     of_timeout_sec: 1.0        # Reset OF if no good update within this window
     vps_timeout_sec: 3.0       # Mark VPS stale if no fix within this window
     imu_timeout_sec: 1.0       # Mark IMU stale if no message within this window
-    of_fail_threshold: 5
+    of_fail_threshold: 5       # Fail streak threshold before recovery actions
   adaptive_rates:
     enabled: true
     vio_rate_min_hz: 10

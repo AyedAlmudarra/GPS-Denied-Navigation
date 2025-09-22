@@ -2,9 +2,14 @@
 """
 MAVLink Sender for GPS-denied Visual Navigation
 
-- Sends VISION_POSITION_ESTIMATE with yaw + covariance
-- Optionally reads IMU (RAW_IMU) or ATTITUDE messages
+- Sends VISION_POSITION_ESTIMATE with yaw + covariance (21-element vector)
+- Optionally reads IMU (RAW_IMU) or ATTITUDE messages for aiding
 - Supports dynamic covariance and optional VISION_SPEED_ESTIMATE
+
+Notes
+- Use connection strings like 'tcp:127.0.0.1:5762', 'udp:0.0.0.0:14550', or 'serial:/dev/ttyUSB0:57600'.
+- Covariance inputs are variances (not standard deviations). Per MAVLink spec,
+  yaw variance is the last element (index 20) in the 21-vector.
 """
 
 import time
@@ -17,6 +22,15 @@ class MAVLinkSender:
     def __init__(self, connection_str="tcp:127.0.0.1:5762", vision_rate_hz=10, heartbeat_timeout_sec=10):
         """
         Initialize MAVLink connection to ArduPilot.
+
+        Parameters
+        ----------
+        connection_str : str
+            MAVLink connection string. Examples: 'tcp:127.0.0.1:5762', 'udp:0.0.0.0:14550'.
+        vision_rate_hz : int
+            Rate to send vision messages (used in example loop).
+        heartbeat_timeout_sec : int
+            Seconds to wait for HEARTBEAT before proceeding.
         """
         logging.info(f"Connecting to MAVLink at {connection_str}")
         # Validate connection string scheme
@@ -41,6 +55,7 @@ class MAVLinkSender:
             logging.warning("Heartbeat timeout; proceeding without confirmation (will keep polling)")
 
     def _wait_heartbeat_with_timeout(self, timeout_sec=10):
+        """Wait for HEARTBEAT up to timeout_sec seconds; returns True if received."""
         deadline = time.time() + float(timeout_sec)
         # Try native wait_heartbeat with timeout if available
         try:
@@ -59,7 +74,7 @@ class MAVLinkSender:
     def set_message_interval(self, msg_id, rate_hz):
         """
         Request ArduPilot to send specified message ID at the desired rate.
-        Example: GLOBAL_POSITION_INT = 33
+        Example: GLOBAL_POSITION_INT = 33. Interval is in microseconds.
         """
         self.conn.mav.command_long_send(
             self.conn.target_system,
@@ -75,6 +90,7 @@ class MAVLinkSender:
     def start(self):
         """
         Start streaming specific MAVLink messages from the autopilot.
+        Requests: RAW_IMU (27) at 10 Hz, ATTITUDE (30) at 20 Hz, GLOBAL_POSITION_INT (33) at 10 Hz.
         """
         # You can request RAW_IMU (27) or GLOBAL_POSITION_INT (33)
         self.set_message_interval(27, 10)  # RAW_IMU
@@ -82,9 +98,7 @@ class MAVLinkSender:
         self.set_message_interval(33, 10)  # GLOBAL_POSITION_INT at 10 Hz
 
     def stop(self):
-        """
-        Clean shutdown of MAVLink connection.
-        """
+        """Clean shutdown of MAVLink connection."""
         self.conn.close()
         logging.info("Closed MAVLink connection")
 
@@ -93,6 +107,7 @@ class MAVLinkSender:
         Build a 21-element covariance vector for VISION_POSITION_ESTIMATE.
         Inputs are variances (not standard deviations).
         Fills diagonals for x,y,z and yaw; others left as zero for simplicity.
+        Indices used: 0=x, 6=y, 11=z, 20=yaw.
         """
         cov = [0.0] * 21
         # Diagonals for x,y,z (positions)
@@ -107,11 +122,16 @@ class MAVLinkSender:
         """
         Send vision position estimate to ArduPilot.
 
-        Params:
-            x, y, z    - position in meters
-            yaw        - heading in radians
-            covariance - base variance for positions (used to build 21-vector)
-            yaw_sigma  - variance for yaw element
+        Parameters
+        ----------
+        x, y, z : float
+            Position in meters.
+        yaw : float
+            Heading in radians.
+        covariance : float
+            Base position variance used for x,y,z entries in 21-vector.
+        yaw_sigma : float
+            Variance for yaw element (despite the name), placed at index 20.
         """
         t_boot_ms = int((time.time() - self.start_time) * 1000) & 0xFFFFFFFF
         cov_vec = self._make_cov21(pos_variance=covariance, yaw_variance=yaw_sigma)
@@ -124,9 +144,7 @@ class MAVLinkSender:
         logging.debug(f"Sent VISION_POSITION_ESTIMATE: x={x:.2f}, y={y:.2f}, z={z:.2f}, yaw={yaw:.2f}, cov_pos={covariance:.3f}, cov_yaw={yaw_sigma:.3f}")
 
     def send_vision_speed(self, vx, vy, vz, covariance=1.0):
-        """
-        Optionally send vision speed estimate if available.
-        """
+        """Optionally send vision speed estimate (vx, vy, vz) in m/s."""
         t_boot_ms = int((time.time() - self.start_time) * 1000) & 0xFFFFFFFF
         # MAVLink VISION_SPEED_ESTIMATE only takes vx,vy,vz (m/s)
         self.conn.mav.vision_speed_estimate_send(
@@ -136,7 +154,7 @@ class MAVLinkSender:
         logging.debug(f"Sent VISION_SPEED_ESTIMATE: vx={vx:.2f}, vy={vy:.2f}, vz={vz:.2f}")
 
     def poll(self, max_msgs=10):
-        """Poll up to max_msgs non-blocking messages and update caches."""
+        """Poll up to max_msgs non-blocking messages and update caches (RAW_IMU, ATTITUDE)."""
         for _ in range(max_msgs):
             msg = self.conn.recv_match(type=['RAW_IMU', 'ATTITUDE'], blocking=False)
             if not msg:
@@ -162,10 +180,12 @@ class MAVLinkSender:
                 }
 
     def latest_raw_imu(self):
+        """Return latest RAW_IMU dict if available; polls non-blocking first."""
         self.poll()
         return self.last_raw_imu
 
     def latest_attitude(self):
+        """Return latest ATTITUDE dict if available; polls non-blocking first."""
         self.poll()
         return self.last_attitude
 

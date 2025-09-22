@@ -3,9 +3,38 @@ import numpy as np
 from collections import deque
 import logging
 
+"""
+OpticalFlowTracker
+------------------
+Dense-enough sparse-tracking pipeline for planar translational flow using ORB seeding
+and Lucas–Kanade (LK) pyramidal optical flow with robust estimation and gating.
+
+Key ideas
+- Image preprocessing: grayscale + histogram equalization; optional undistortion.
+- Optional image downscaling for performance; all flow vectors are rescaled back.
+- Feature seeding: grid-based ORB seeding (optional) or ROI-based detection.
+- Tracking: LK forward flow, optional forward–backward check to reject outliers.
+- Robust motion model: affine model estimated with RANSAC; residual-based gating.
+- Motion mask: dynamic regions (large residuals) are suppressed for VPS.
+- Velocity estimation: median flow → meters using altitude / focal length.
+- ZUPT: zero-velocity update when flow magnitude is below adaptive threshold.
+
+Return semantics of update(frame, altitude, dt)
+- Returns (vx_m, vy_m, confidence), where vx/vy are planar translational flow magnitudes
+  in meters per frame converted to meters per second if dt is provided; internally we
+  compute flow in meters and divide by dt only for confidence/velocity smoothing, while
+  the function returns the planar displacement per frame in meters (flow_m components).
+- Confidence in [0,1] combines inlier ratio and residual quality.
+
+Requirements
+- `focal_length_px` must be set (pixels). Altitude in meters is passed per frame.
+- For undistortion, provide `camera` intrinsics in the config.
+"""
+
 class OpticalFlowTracker:
     def __init__(self, config):
         cfg = config["vision"]["flow"]
+        # Detection and LK parameters
         self.max_corners = cfg.get("max_corners", 200)
         self.quality_level = cfg.get("quality_level", 0.01)
         self.min_distance = cfg.get("min_distance", 7)
@@ -20,7 +49,7 @@ class OpticalFlowTracker:
         # Optional downscale factor for performance (process smaller image)
         self.downscale = float(cfg.get("downscale", 1.0))
 
-        # Camera intrinsics (optional)
+        # Camera intrinsics (optional) for undistortion
         cam_cfg = config.get("camera", {})
         self.fx = cam_cfg.get("fx", None)
         self.fy = cam_cfg.get("fy", None)
@@ -44,6 +73,7 @@ class OpticalFlowTracker:
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
         )
 
+        # ORB used for seeding points; we keep ORB here even if VPS uses SIFT
         self.orb = cv2.ORB_create(nfeatures=self.max_corners)
         self.prev_gray = None
         self.prev_kps = None
@@ -54,7 +84,7 @@ class OpticalFlowTracker:
         self.prev_pts = None  # Nx2 array of points
         self.prev_pts_ids = []  # List of feature IDs
 
-        # For visualization overlays
+        # For visualization overlays (consumed by UI)
         self.prev_points = None  # inlier previous points (Nx2)
         self.last_points = None  # inlier current points (Nx2)
 
@@ -92,6 +122,10 @@ class OpticalFlowTracker:
         self.motion_mask = None
 
     def _ensure_ud_maps(self, gray):
+        """Ensure undistortion maps are available for the given image size.
+
+        Returns True if maps are prepared and undistortion should be applied.
+        """
         if self.K is None or self.dist is None:
             return False
         h, w = gray.shape[:2]
@@ -103,6 +137,7 @@ class OpticalFlowTracker:
         return True
 
     def _undistort(self, gray):
+        """Undistort grayscale image if intrinsics are available."""
         if self.K is None or self.dist is None:
             return gray
         if self._ensure_ud_maps(gray):
@@ -110,6 +145,7 @@ class OpticalFlowTracker:
         return gray
 
     def _detect_in_roi(self, gray, pts):
+        """Detect ORB keypoints within a padded ROI around prior inliers."""
         h, w = gray.shape[:2]
         if pts is None or len(pts) == 0:
             kps = self.orb.detect(gray, None)
@@ -129,6 +165,7 @@ class OpticalFlowTracker:
         return pts_roi
 
     def _detect_grid(self, gray):
+        """Detect ORB features uniformly across a grid to ensure coverage."""
         if self.grid_rows <= 0 or self.grid_cols <= 0 or self.features_per_cell <= 0:
             kps = self.orb.detect(gray, None)
             return np.array([kp.pt for kp in kps], dtype=np.float32)
@@ -157,6 +194,7 @@ class OpticalFlowTracker:
         return np.array(pts_list, dtype=np.float32)
 
     def initialize(self, first_frame):
+        """Initialize tracking on the first frame by detecting seed features."""
         frame_gray_full = self._illumination_normalize(first_frame)
         frame_gray_full = self._undistort(frame_gray_full)
         if self.downscale != 1.0:
@@ -179,20 +217,19 @@ class OpticalFlowTracker:
         self.motion_mask = None
 
     def _has_sufficient_texture(self, gray):
-        # Use variance of Laplacian to measure texture quality
+        """Return whether image has enough texture using variance of Laplacian."""
         lap = cv2.Laplacian(gray, cv2.CV_64F)
         var_lap = lap.var()
         self.last_texture_var = float(var_lap)
         return var_lap >= self.min_texture_var, var_lap
 
     def _illumination_normalize(self, img):
-        # Convert to grayscale if needed
+        """Convert to grayscale and apply histogram equalization."""
         gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Histogram equalization to reduce lighting effects
         return cv2.equalizeHist(gray)
 
     def _assign_feature_ids(self, pts, prev_pts, prev_ids, max_distance=5.0):
-        # Match new pts to previous pts by nearest neighbor within max_distance
+        """Assign stable IDs to features by nearest neighbor association."""
         new_ids = []
         if prev_pts is None or len(prev_pts) == 0:
             # Assign new IDs to all
@@ -215,6 +252,27 @@ class OpticalFlowTracker:
         return new_ids
 
     def update(self, frame, altitude, dt=None):
+        """Track optical flow and estimate planar motion.
+
+        Parameters
+        ----------
+        frame : np.ndarray (H,W,3) BGR
+            Current frame.
+        altitude : float
+            Altitude in meters used for pixel→meter conversion.
+        dt : float | None
+            Time delta between frames in seconds. If None, a 30 FPS fallback is used
+            for internal velocity smoothing only; return values remain in meters per frame.
+
+        Returns
+        -------
+        dx_m : float
+            Planar displacement in meters along x per frame (camera frame → map frame handled upstream).
+        dy_m : float
+            Planar displacement in meters along y per frame.
+        confidence : float in [0,1]
+            Confidence of this update based on inlier ratio and residuals.
+        """
         self.altitude = altitude
         frame_gray_full = self._illumination_normalize(frame)
         frame_gray_full = self._undistort(frame_gray_full)
@@ -313,7 +371,15 @@ class OpticalFlowTracker:
             return 0.0, 0.0, 1e-6
 
         # Robust estimation using affine model (RANSAC)
-        M, inlier_mask = cv2.estimateAffine2D(good_prev, good_next, method=cv2.RANSAC, ransacReprojThreshold=self.ransac_reproj_thresh, maxIters=2000, confidence=0.99, refineIters=10)
+        M, inlier_mask = cv2.estimateAffine2D(
+            good_prev,
+            good_next,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=self.ransac_reproj_thresh,
+            maxIters=2000,
+            confidence=0.99,
+            refineIters=10
+        )
         if M is None or inlier_mask is None:
             # Reset on failure (prefer grid or ROI)
             if self.grid_rows > 0 and self.grid_cols > 0 and self.features_per_cell > 0:
@@ -351,7 +417,7 @@ class OpticalFlowTracker:
         inlier_next = good_next[inliers]
         inlier_ids = [gid for gid, keep in zip(good_ids, inliers) if keep]
 
-        # Residuals and gating
+        # Residuals and gating (median + MAD for robust scale)
         pred = (inlier_prev @ M[:,:2].T) + M[:,2]
         residuals = np.linalg.norm(pred - inlier_next, axis=1)
         med = np.median(residuals)
@@ -415,7 +481,7 @@ class OpticalFlowTracker:
             else:
                 velocity = flow_m / (1.0 / 30.0)  # fallback to 30 FPS assumption
 
-        # Smooth velocity
+        # Smooth velocity (used for diagnostics/UI)
         self.vel_buffer.append(velocity)
         smooth_velocity = np.mean(np.array(self.vel_buffer), axis=0)
         self.last_vel = smooth_velocity
